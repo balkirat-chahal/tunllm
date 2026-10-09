@@ -3,14 +3,6 @@ import { RTCPeerConnection } from "node-datachannel/polyfill";
 const SIGNALING_URL = process.env.SIGNALING_URL ?? "ws://127.0.0.1:3001/ws";
 const ROOM = process.env.ROOM ?? "tunllm";
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://127.0.0.1:11434";
-const STUN_URL = process.env.STUN_URL ?? "stun:127.0.0.1:3478";
-
-// Google publishes free public STUN servers. They are not TURN relays.
-const iceServers: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-  { urls: STUN_URL },
-];
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
@@ -23,6 +15,7 @@ type SignalIn = {
   type: string;
   description?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
+  iceServers?: RTCIceServer[];
   message?: string;
 };
 
@@ -81,15 +74,92 @@ function sendSignal(ws: WebSocket, payload: unknown) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
 }
 
+async function logIcePath(pc: RTCPeerConnection) {
+  try {
+    const stats = await pc.getStats();
+    for (const report of stats.values()) {
+      const pair = report as {
+        type: string;
+        nominated?: boolean;
+        localCandidateId?: string;
+        remoteCandidateId?: string;
+      };
+      if (pair.type !== "candidate-pair" || !pair.nominated) continue;
+      const local = stats.get(pair.localCandidateId ?? "") as { candidateType?: string } | undefined;
+      const remote = stats.get(pair.remoteCandidateId ?? "") as { candidateType?: string } | undefined;
+      console.log(`ice ${local?.candidateType ?? "?"} -> ${remote?.candidateType ?? "?"}`);
+    }
+  } catch {
+    // node-datachannel stats are optional
+  }
+}
+
 function connect() {
   const ws = new WebSocket(SIGNALING_URL);
   let pc: RTCPeerConnection | null = null;
+  let iceServers: RTCIceServer[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+  ];
+  let iceReady = false;
+  let pendingOffer: RTCSessionDescriptionInit | undefined;
   const history: ChatMessage[] = [];
 
   const closePeer = () => {
     pc?.close();
     pc = null;
     history.length = 0;
+  };
+
+  const acceptOffer = async (description: RTCSessionDescriptionInit) => {
+    closePeer();
+    pc = new RTCPeerConnection({ iceServers });
+
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) sendSignal(ws, { type: "ice", candidate: serializeCandidate(candidate) });
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      if (pc?.iceConnectionState === "connected" || pc?.iceConnectionState === "completed") {
+        void logIcePath(pc);
+      }
+    };
+
+    pc.ondatachannel = ({ channel }) => {
+      console.log("data channel", channel.label);
+
+      channel.onmessage = async ({ data }) => {
+        let payload: ChannelPayload;
+        try {
+          payload = JSON.parse(String(data)) as ChannelPayload;
+        } catch {
+          channel.send(JSON.stringify({ type: "error", content: "invalid json" } satisfies ChannelPayload));
+          return;
+        }
+        if (payload.type !== "user") return;
+
+        console.log("prompt", payload.content);
+        history.push({ role: "user", content: payload.content });
+        try {
+          const content = await askOllama(history);
+          history.push({ role: "assistant", content });
+          console.log("reply", content.slice(0, 120));
+          channel.send(JSON.stringify({ type: "assistant", content } satisfies ChannelPayload));
+        } catch (err) {
+          const content = err instanceof Error ? err.message : String(err);
+          console.error("ollama", content);
+          channel.send(JSON.stringify({ type: "error", content } satisfies ChannelPayload));
+        }
+      };
+    };
+
+    await pc.setRemoteDescription(description);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    sendSignal(ws, {
+      type: "answer",
+      description: { type: pc.localDescription?.type, sdp: pc.localDescription?.sdp },
+    });
   };
 
   ws.addEventListener("open", () => {
@@ -110,6 +180,18 @@ function connect() {
       return;
     }
 
+    if (msg.type === "ice-config" && msg.iceServers) {
+      iceServers = msg.iceServers;
+      iceReady = true;
+      console.log("ice-config", iceServers.length, "servers");
+      if (pendingOffer) {
+        const offer = pendingOffer;
+        pendingOffer = undefined;
+        await acceptOffer(offer);
+      }
+      return;
+    }
+
     if (msg.type === "peer-left") {
       console.log("phone left");
       closePeer();
@@ -117,48 +199,11 @@ function connect() {
     }
 
     if (msg.type === "offer" && msg.description) {
-      closePeer();
-      pc = new RTCPeerConnection({ iceServers });
-
-      pc.onicecandidate = ({ candidate }) => {
-        if (candidate) sendSignal(ws, { type: "ice", candidate: serializeCandidate(candidate) });
-      };
-
-      pc.ondatachannel = ({ channel }) => {
-        console.log("data channel", channel.label);
-
-        channel.onmessage = async ({ data }) => {
-          let payload: ChannelPayload;
-          try {
-            payload = JSON.parse(String(data)) as ChannelPayload;
-          } catch {
-            channel.send(JSON.stringify({ type: "error", content: "invalid json" } satisfies ChannelPayload));
-            return;
-          }
-          if (payload.type !== "user") return;
-
-          console.log("prompt", payload.content);
-          history.push({ role: "user", content: payload.content });
-          try {
-            const content = await askOllama(history);
-            history.push({ role: "assistant", content });
-            console.log("reply", content.slice(0, 120));
-            channel.send(JSON.stringify({ type: "assistant", content } satisfies ChannelPayload));
-          } catch (err) {
-            const content = err instanceof Error ? err.message : String(err);
-            console.error("ollama", content);
-            channel.send(JSON.stringify({ type: "error", content } satisfies ChannelPayload));
-          }
-        };
-      };
-
-      await pc.setRemoteDescription(msg.description);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      sendSignal(ws, {
-        type: "answer",
-        description: { type: pc.localDescription?.type, sdp: pc.localDescription?.sdp },
-      });
+      if (!iceReady) {
+        pendingOffer = msg.description;
+        return;
+      }
+      await acceptOffer(msg.description);
       return;
     }
 

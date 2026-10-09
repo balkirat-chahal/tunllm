@@ -5,6 +5,10 @@ import type { WSContext } from "hono/ws";
 import { networkInterfaces, type NetworkInterfaceInfo } from "node:os";
 
 const PORT = Number(process.env.SIGNALING_PORT ?? 3001);
+const TURN_API_URL = process.env.TURN_API_URL ?? "http://127.0.0.1:3480";
+const TURN_API_SECRET = process.env.TURN_API_SECRET ?? "tunllm-turn-api";
+const TURN_PORT = process.env.TURN_PORT ?? "3479";
+const STUN_PORT = process.env.STUN_PORT ?? "3478";
 
 type Role = "desktop" | "phone";
 
@@ -17,13 +21,21 @@ type SignalMessage =
   | { type: "answer"; description: Description }
   | { type: "ice"; candidate: IceCandidate };
 
+type IceServer = {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+};
+
 type Room = {
   desktop?: WSContext;
   phone?: WSContext;
 };
 
+type Client = { role: Role; room: string; ws: WSContext; turnUser?: string };
+
 const rooms = new Map<string, Room>();
-const sockets = new Map<unknown, { role: Role; room: string; ws: WSContext }>();
+const sockets = new Map<unknown, Client>();
 
 function id(ws: WSContext) {
   return ws.raw ?? ws;
@@ -44,6 +56,71 @@ function lanAddresses() {
       Boolean(iface && !iface.internal && iface.family === "IPv4"),
     )
     .map((iface) => iface.address);
+}
+
+const publicHost = process.env.TURN_PUBLIC_HOST ?? process.env.TURN_EXTERNAL_IP ?? lanAddresses()[0] ?? "127.0.0.1";
+
+function stunServers(): IceServer[] {
+  return [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    { urls: `stun:${publicHost}:${STUN_PORT}` },
+  ];
+}
+
+async function mintTurn() {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      const res = await fetch(`${TURN_API_URL}/credentials`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${TURN_API_SECRET}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ttl: 3600 }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      return (await res.json()) as { username: string; credential: string };
+    } catch (err) {
+      if (attempt === 9) {
+        console.error("turn mint failed", err instanceof Error ? err.message : err);
+        return null;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+  return null;
+}
+
+async function revokeTurn(username: string | undefined) {
+  if (!username) return;
+  try {
+    await fetch(`${TURN_API_URL}/credentials/${encodeURIComponent(username)}`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${TURN_API_SECRET}` },
+    });
+  } catch {
+    // TURN process may already be gone
+  }
+}
+
+function iceServers(turn: { username: string; credential: string } | null): IceServer[] {
+  const servers = stunServers();
+  if (turn) {
+    servers.push({
+      urls: `turn:${publicHost}:${TURN_PORT}?transport=udp`,
+      username: turn.username,
+      credential: turn.credential,
+    });
+  }
+  return servers;
+}
+
+async function pushIceConfig(ws: WSContext) {
+  const turn = await mintTurn();
+  const meta = sockets.get(id(ws));
+  if (meta) meta.turnUser = turn?.username;
+  send(ws, { type: "ice-config", iceServers: iceServers(turn) });
 }
 
 const app = new Hono();
@@ -69,6 +146,8 @@ app.get(
         const room = rooms.get(msg.room) ?? {};
         const existing = room[msg.role];
         if (existing && id(existing) !== id(ws)) {
+          const old = sockets.get(id(existing));
+          void revokeTurn(old?.turnUser);
           sockets.delete(id(existing));
         }
 
@@ -76,6 +155,7 @@ app.get(
         rooms.set(msg.room, room);
         sockets.set(id(ws), { role: msg.role, room: msg.room, ws });
         send(ws, { type: "joined", role: msg.role, room: msg.room });
+        void pushIceConfig(ws);
 
         if (room.desktop && room.phone) {
           send(room.phone, { type: "ready" });
@@ -99,6 +179,7 @@ app.get(
       const meta = sockets.get(id(ws));
       if (!meta) return;
       sockets.delete(id(ws));
+      void revokeTurn(meta.turnUser);
 
       const room = rooms.get(meta.room);
       if (!room) return;
@@ -116,6 +197,7 @@ const server = serve({ fetch: app.fetch, hostname: "0.0.0.0", port: PORT }, () =
   for (const ip of lanAddresses()) {
     console.log(`signaling ws://${ip}:${PORT}/ws`);
   }
+  console.log(`signaling ice host ${publicHost}`);
 });
 
 injectWebSocket(server);

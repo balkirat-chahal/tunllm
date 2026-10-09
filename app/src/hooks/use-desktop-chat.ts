@@ -12,15 +12,24 @@ type SignalIn = {
   type: string;
   description?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit;
+  iceServers?: RTCIceServer[];
   message?: string;
 };
 
-function iceServers(): RTCIceServer[] {
-  return [
-    { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: `stun:${window.location.hostname}:3478` },
-  ];
+async function logIcePath(pc: RTCPeerConnection) {
+  const stats = await pc.getStats();
+  for (const report of stats.values()) {
+    const pair = report as {
+      type: string;
+      nominated?: boolean;
+      localCandidateId?: string;
+      remoteCandidateId?: string;
+    };
+    if (pair.type !== "candidate-pair" || !pair.nominated) continue;
+    const local = stats.get(pair.localCandidateId ?? "") as { candidateType?: string } | undefined;
+    const remote = stats.get(pair.remoteCandidateId ?? "") as { candidateType?: string } | undefined;
+    console.log(`ice ${local?.candidateType ?? "?"} -> ${remote?.candidateType ?? "?"}`);
+  }
 }
 
 function signalingUrl() {
@@ -48,6 +57,9 @@ export function useDesktopChat(room = "tunllm") {
     let cancelled = false;
     let ws: WebSocket | null = null;
     let pc: RTCPeerConnection | null = null;
+    let iceServers: RTCIceServer[] | null = null;
+    let peerReady = false;
+    let started = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
 
     const closePeer = () => {
@@ -59,20 +71,27 @@ export function useDesktopChat(room = "tunllm") {
     const connect = () => {
       if (cancelled) return;
       setStatus("connecting");
+      iceServers = null;
+      peerReady = false;
+      started = false;
       ws = new WebSocket(signalingUrl());
 
       const send = (payload: unknown) => {
         if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
       };
 
-      const startCall = async () => {
+      const startCall = async (servers: RTCIceServer[]) => {
+        if (started) return;
+        started = true;
         closePeer();
-        pc = new RTCPeerConnection({ iceServers: iceServers() });
-        const channel = pc.createDataChannel("ollama");
+        pc = new RTCPeerConnection({ iceServers: servers });
+        const peer = pc;
+        const channel = peer.createDataChannel("ollama");
         channelRef.current = channel;
 
         channel.onopen = () => {
           if (!cancelled) setStatus("connected");
+          void logIcePath(peer);
         };
         channel.onclose = () => {
           if (!cancelled) {
@@ -109,6 +128,11 @@ export function useDesktopChat(room = "tunllm") {
         });
       };
 
+      const maybeStart = () => {
+        if (!peerReady || !iceServers || cancelled) return;
+        void startCall(iceServers);
+      };
+
       ws.onopen = () => send({ type: "join", role: "phone", room });
 
       ws.onmessage = async (event) => {
@@ -121,8 +145,14 @@ export function useDesktopChat(room = "tunllm") {
           setStatus("waiting");
           return;
         }
+        if (msg.type === "ice-config" && msg.iceServers) {
+          iceServers = msg.iceServers;
+          maybeStart();
+          return;
+        }
         if (msg.type === "ready") {
-          await startCall();
+          peerReady = true;
+          maybeStart();
           return;
         }
         if (msg.type === "answer" && msg.description && pc) {
@@ -138,6 +168,8 @@ export function useDesktopChat(room = "tunllm") {
           return;
         }
         if (msg.type === "peer-left") {
+          peerReady = false;
+          started = false;
           closePeer();
           setStatus("waiting");
           setPending(false);

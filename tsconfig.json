@@ -11,5 +11,5 @@
     "noUncheckedIndexedAccess": true,
     "types": ["node"]
   },
-  "include": ["stun.ts", "signaling.ts", "desktop.ts"]
+  "include": ["stun.ts", "turn.ts", "signaling.ts", "desktop.ts"]
 }
